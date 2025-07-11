@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 )
 
@@ -81,8 +80,6 @@ func check_name_in_blacklist(name string) bool {
 	return false
 }
 
-var mu sync.Mutex
-
 func stash(stash *Stash) {
 	create_gostash_folder()
 	fmt.Println("Stashing")
@@ -98,8 +95,6 @@ func stash(stash *Stash) {
 		return
 	}
 
-	var wg sync.WaitGroup
-
 	for _, entry := range entries {
 		if entry.IsDir() || check_name_in_blacklist(entry.Name()) {
 			continue
@@ -108,28 +103,15 @@ func stash(stash *Stash) {
 		srcPath := entry.Name()
 		dstPath := filepath.Join(todayFolder, entry.Name())
 
-		// Increment WaitGroup counter for each file operation
-		wg.Add(1)
+		// Move file to stash folder
+		if err := moveFile(srcPath, dstPath); err != nil {
+			fmt.Println("Error moving file:", err)
+			continue
+		}
 
-		go func(src, dst string) {
-			defer wg.Done() // Decrement the counter when the goroutine completes
-
-			// Move file to stash folder
-			if err := moveFile(src, dst); err != nil {
-				fmt.Println("Error moving file:", err)
-				return
-			}
-
-			// Lock the map to avoid race conditions
-			mu.Lock()
-			defer mu.Unlock()
-			stash.FilesByDate[todayFolder] = append(stash.FilesByDate[todayFolder], dst)
-
-		}(srcPath, dstPath)
+		// Append the destination path to the list for today's date
+		stash.FilesByDate[todayFolder] = append(stash.FilesByDate[todayFolder], dstPath)
 	}
-
-	// Wait for all file-moving goroutines to complete
-	wg.Wait()
 
 	save_config(*stash)
 	fmt.Println("Stashed", len(stash.FilesByDate[todayFolder]), "files")
