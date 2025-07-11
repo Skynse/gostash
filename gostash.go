@@ -1,77 +1,156 @@
+// gostash.go
 package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
-type Stash struct {
-	FilesByDate map[string][]string `json:"files_by_date"`
+type StashMode string
+
+const (
+	ModeSimple     StashMode = "simple"
+	ModeCategorize StashMode = "categorize"
+)
+
+type StashConfig struct {
+	FilesByDate map[string]StashEntry `json:"files_by_date"`
 }
 
-func save_config(stash Stash) {
-	fmt.Println("Saving config file:", ".gostash.json")
-
-	file, err := os.OpenFile("./.gostash.json", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0755)
-	if err != nil {
-		fmt.Println("Error opening config file:", err)
-		return
-	}
-	defer file.Close()
-
-	jsonData, err := json.Marshal(stash)
-	if err != nil {
-		fmt.Println("Error marshaling JSON:", err)
-		return
-	}
-
-	_, err = file.Write(jsonData)
-	if err != nil {
-		fmt.Println("Error writing JSON to file:", err)
-	}
+type StashEntry struct {
+	Mode       StashMode           `json:"mode"`
+	Files      []string            `json:"files"`
+	Folders    []string            `json:"folders"`
+	Categories map[string][]string `json:"categories,omitempty"` // category -> files
 }
 
-func get_today_gostash_folder() string {
+type CLI struct {
+	Command    string
+	Date       string
+	Categorize bool
+	Help       bool
+}
+
+// File type detection
+func getFileCategory(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+
+	categories := map[string][]string{
+		"images":      {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp", ".ico"},
+		"documents":   {".pdf", ".doc", ".docx", ".txt", ".rtf", ".odt", ".pages"},
+		"videos":      {".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm", ".m4v"},
+		"audio":       {".mp3", ".wav", ".flac", ".aac", ".ogg", ".wma", ".m4a"},
+		"archives":    {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"},
+		"code":        {".go", ".py", ".js", ".html", ".css", ".java", ".cpp", ".c", ".h"},
+		"data":        {".json", ".xml", ".csv", ".sql", ".db", ".sqlite"},
+		"executables": {".exe", ".msi", ".deb", ".rpm", ".dmg", ".app"},
+	}
+
+	for category, extensions := range categories {
+		for _, validExt := range extensions {
+			if ext == validExt {
+				return category
+			}
+		}
+	}
+
+	return "misc"
+}
+
+func parseCLI() CLI {
+	var cli CLI
+
+	flag.BoolVar(&cli.Categorize, "categorize", true, "Categorize files by type (default: true)")
+	flag.BoolVar(&cli.Categorize, "c", true, "Categorize files by type (shorthand)")
+	flag.BoolVar(&cli.Help, "help", false, "Show help")
+	flag.BoolVar(&cli.Help, "h", false, "Show help (shorthand)")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] <command> [date]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Commands:\n")
+		fmt.Fprintf(os.Stderr, "  stash     Stash files in current directory\n")
+		fmt.Fprintf(os.Stderr, "  unstash   Unstash files (optionally specify date)\n")
+		fmt.Fprintf(os.Stderr, "  list      List available stashes\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  %s stash                    # Stash with categorization\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -categorize=false stash  # Stash without categorization\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s unstash 2024-01-15      # Unstash specific date\n", os.Args[0])
+	}
+
+	flag.Parse()
+
+	if cli.Help {
+		flag.Usage()
+		os.Exit(0)
+	}
+
+	args := flag.Args()
+	if len(args) < 1 {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	cli.Command = args[0]
+	if len(args) > 1 {
+		cli.Date = args[1]
+	}
+
+	return cli
+}
+
+func getTodayStashFolder() string {
 	return "gostash-" + time.Now().Format("2006-01-02")
 }
 
-func load_config(stash *Stash) {
-	check_config_exists()
-
-	fmt.Println("Loading config file:", ".gostash.json")
-
-	file, err := os.Open("./.gostash.json")
+func saveConfig(config StashConfig) error {
+	file, err := os.OpenFile("./.gostash.json", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
-		fmt.Println("Error opening config file:", err)
-		return
+		return fmt.Errorf("error opening config file: %w", err)
 	}
 	defer file.Close()
 
-	// Decode JSON directly into the stash pointer
-	dec := json.NewDecoder(file)
-	if err := dec.Decode(stash); err != nil {
-		fmt.Println("Error decoding JSON:", err)
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(config); err != nil {
+		return fmt.Errorf("error encoding JSON: %w", err)
 	}
+
+	return nil
 }
 
-func moveFile(src, dst string) error {
-	return os.Rename(src, dst) // Moves the file from src to dst
-}
+func loadConfig() (StashConfig, error) {
+	config := StashConfig{
+		FilesByDate: make(map[string]StashEntry),
+	}
 
-func create_gostash_folder() {
-	folder_name := get_today_gostash_folder()
-	err := os.Mkdir(folder_name, 0755)
+	if _, err := os.Stat("./.gostash.json"); os.IsNotExist(err) {
+		// Create empty config file
+		return config, saveConfig(config)
+	}
+
+	file, err := os.Open("./.gostash.json")
 	if err != nil {
-		fmt.Println("Error creating gostash folder", err)
+		return config, fmt.Errorf("error opening config file: %w", err)
 	}
+	defer file.Close()
+
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&config); err != nil {
+		return config, fmt.Errorf("error decoding JSON: %w", err)
+	}
+
+	return config, nil
 }
 
-func check_name_in_blacklist(name string) bool {
-	today := get_today_gostash_folder()
-	blacklist := []string{".gostash.json", today}
+func isBlacklisted(name string, stashFolder string) bool {
+	blacklist := []string{".gostash.json", stashFolder}
 	for _, item := range blacklist {
 		if item == name {
 			return true
@@ -80,110 +159,221 @@ func check_name_in_blacklist(name string) bool {
 	return false
 }
 
-func stash(stash *Stash) {
-	create_gostash_folder()
-	fmt.Println("Stashing")
-
-	todayFolder := get_today_gostash_folder()
-	if stash.FilesByDate == nil {
-		stash.FilesByDate = make(map[string][]string)
+func createStashStructure(baseFolder string, categorize bool, categories map[string]bool) error {
+	if err := os.MkdirAll(baseFolder, 0755); err != nil {
+		return fmt.Errorf("error creating base folder: %w", err)
 	}
+
+	if categorize {
+		for category := range categories {
+			categoryPath := filepath.Join(baseFolder, category)
+			if err := os.MkdirAll(categoryPath, 0755); err != nil {
+				return fmt.Errorf("error creating category folder %s: %w", category, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func stashFiles(config *StashConfig, categorize bool) error {
+	stashFolder := getTodayStashFolder()
+
+	// First pass: determine what categories we need
+	categories := make(map[string]bool)
+	var filesToStash []os.DirEntry
+	var foldersToStash []os.DirEntry
 
 	entries, err := os.ReadDir(".")
 	if err != nil {
-		fmt.Println("Error reading directory:", err)
-		return
+		return fmt.Errorf("error reading directory: %w", err)
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() || check_name_in_blacklist(entry.Name()) {
+		if isBlacklisted(entry.Name(), stashFolder) {
 			continue
 		}
 
-		srcPath := entry.Name()
-		dstPath := filepath.Join(todayFolder, entry.Name())
-
-		// Move file to stash folder
-		if err := moveFile(srcPath, dstPath); err != nil {
-			fmt.Println("Error moving file:", err)
-			continue
+		if entry.IsDir() {
+			foldersToStash = append(foldersToStash, entry)
+		} else {
+			filesToStash = append(filesToStash, entry)
+			if categorize {
+				category := getFileCategory(entry.Name())
+				categories[category] = true
+			}
 		}
-
-		// Append the destination path to the list for today's date
-		stash.FilesByDate[todayFolder] = append(stash.FilesByDate[todayFolder], dstPath)
 	}
 
-	save_config(*stash)
-	fmt.Println("Stashed", len(stash.FilesByDate[todayFolder]), "files")
+	if len(filesToStash) == 0 && len(foldersToStash) == 0 {
+		fmt.Println("No files or folders to stash")
+		return nil
+	}
+
+	// Create stash structure
+	if err := createStashStructure(stashFolder, categorize, categories); err != nil {
+		return err
+	}
+
+	// Initialize stash entry
+	entry := StashEntry{
+		Files:   make([]string, 0),
+		Folders: make([]string, 0),
+	}
+
+	if categorize {
+		entry.Mode = ModeCategorize
+		entry.Categories = make(map[string][]string)
+	} else {
+		entry.Mode = ModeSimple
+	}
+
+	// Stash files
+	for _, file := range filesToStash {
+		var destPath string
+
+		if categorize {
+			category := getFileCategory(file.Name())
+			destPath = filepath.Join(stashFolder, category, file.Name())
+			entry.Categories[category] = append(entry.Categories[category], destPath)
+		} else {
+			destPath = filepath.Join(stashFolder, file.Name())
+		}
+
+		if err := os.Rename(file.Name(), destPath); err != nil {
+			fmt.Printf("Warning: failed to move file %s: %v\n", file.Name(), err)
+			continue
+		}
+
+		entry.Files = append(entry.Files, destPath)
+	}
+
+	// Stash folders
+	for _, folder := range foldersToStash {
+		destPath := filepath.Join(stashFolder, folder.Name())
+
+		if err := os.Rename(folder.Name(), destPath); err != nil {
+			fmt.Printf("Warning: failed to move folder %s: %v\n", folder.Name(), err)
+			continue
+		}
+
+		entry.Folders = append(entry.Folders, destPath)
+	}
+
+	config.FilesByDate[stashFolder] = entry
+
+	fmt.Printf("Stashed %d files and %d folders", len(entry.Files), len(entry.Folders))
+	if categorize {
+		fmt.Printf(" (categorized into %d categories)", len(entry.Categories))
+	}
+	fmt.Println()
+
+	return saveConfig(*config)
 }
 
-func unstash(stash *Stash) {
-	// Get date from user or use today's date
-	var dateFolder string
-	if len(os.Args) > 2 {
-		dateFolder = "gostash-" + os.Args[2]
-	} else {
-		dateFolder = get_today_gostash_folder()
+func unstashFiles(config *StashConfig, dateFolder string) error {
+	if dateFolder == "" {
+		dateFolder = getTodayStashFolder()
+	} else if !strings.HasPrefix(dateFolder, "gostash-") {
+		dateFolder = "gostash-" + dateFolder
 	}
 
-	filesToUnstash, found := stash.FilesByDate[dateFolder]
-	if !found || len(filesToUnstash) == 0 {
-		fmt.Printf("No files found for date: %s\n", dateFolder)
-		return
+	entry, found := config.FilesByDate[dateFolder]
+	if !found {
+		return fmt.Errorf("no stash found for date: %s", dateFolder)
 	}
 
-	for _, filePath := range filesToUnstash {
+	if len(entry.Files) == 0 && len(entry.Folders) == 0 {
+		return fmt.Errorf("no files or folders to unstash for date: %s", dateFolder)
+	}
+
+	// Unstash files
+	for _, filePath := range entry.Files {
 		fileName := filepath.Base(filePath)
 		destPath := "./" + fileName
 
-		// Move file back to the root directory
 		if err := os.Rename(filePath, destPath); err != nil {
-			fmt.Printf("Error moving file %s back to root: %v\n", filePath, err)
+			fmt.Printf("Warning: failed to restore file %s: %v\n", filePath, err)
 			continue
 		}
 	}
 
-	// Remove the date entry after unstashing
-	delete(stash.FilesByDate, dateFolder)
-	save_config(*stash)
-	fmt.Printf("Unstashed %d files from %s\n", len(filesToUnstash), dateFolder)
+	// Unstash folders
+	for _, folderPath := range entry.Folders {
+		folderName := filepath.Base(folderPath)
+		destPath := "./" + folderName
+
+		if err := os.Rename(folderPath, destPath); err != nil {
+			fmt.Printf("Warning: failed to restore folder %s: %v\n", folderPath, err)
+			continue
+		}
+	}
+
+	// Clean up empty stash folder
+	if err := os.RemoveAll(dateFolder); err != nil {
+		fmt.Printf("Warning: failed to remove stash folder %s: %v\n", dateFolder, err)
+	}
+
+	// Remove from config
+	delete(config.FilesByDate, dateFolder)
+
+	fmt.Printf("Unstashed %d files and %d folders from %s\n",
+		len(entry.Files), len(entry.Folders), dateFolder)
+
+	return saveConfig(*config)
 }
 
-func check_config_exists() {
-	configPath := "./.gostash.json"
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		fmt.Println("Config file does not exist")
-		create_config()
-	} else {
-		fmt.Println("Config file exists")
+func listStashes(config StashConfig) {
+	if len(config.FilesByDate) == 0 {
+		fmt.Println("No stashes found")
+		return
+	}
+
+	fmt.Println("Available stashes:")
+	for date, entry := range config.FilesByDate {
+		fmt.Printf("  %s: %d files, %d folders",
+			strings.TrimPrefix(date, "gostash-"), len(entry.Files), len(entry.Folders))
+
+		if entry.Mode == ModeCategorize && len(entry.Categories) > 0 {
+			fmt.Printf(" (categorized: %s)", strings.Join(getKeys(entry.Categories), ", "))
+		}
+		fmt.Println()
 	}
 }
 
-func create_config() {
-	configPath := "./.gostash.json"
-
-	file, err := os.Create(configPath)
-	if err != nil {
-		fmt.Println("Error creating config file")
+func getKeys(m map[string][]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
 	}
-	defer file.Close()
+	return keys
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: gostash <command> [date]")
+	cli := parseCLI()
+
+	config, err := loadConfig()
+	if err != nil {
+		fmt.Printf("Error loading config: %v\n", err)
 		os.Exit(1)
 	}
 
-	check_config_exists()
-
-	stashConfig := &Stash{}
-	load_config(stashConfig)
-
-	switch os.Args[1] {
+	switch cli.Command {
 	case "stash":
-		stash(stashConfig)
+		if err := stashFiles(&config, cli.Categorize); err != nil {
+			fmt.Printf("Error stashing files: %v\n", err)
+			os.Exit(1)
+		}
 	case "unstash":
-		unstash(stashConfig)
+		if err := unstashFiles(&config, cli.Date); err != nil {
+			fmt.Printf("Error unstashing files: %v\n", err)
+			os.Exit(1)
+		}
+	case "list":
+		listStashes(config)
+	default:
+		fmt.Printf("Unknown command: %s\n", cli.Command)
+		flag.Usage()
+		os.Exit(1)
 	}
 }
